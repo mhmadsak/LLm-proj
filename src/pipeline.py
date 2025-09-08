@@ -7,7 +7,7 @@ import glob
 # Make sibling imports work whether run as a module or a script
 try:
     from .splitting import split_en_general            # Q/A-aware English splitter
-    from .retrieval import retrieve_context               # Google CSE retriever (your version)
+    from .retrieval import retrieve_context               # Google CSE retriever
     from .verify import verify_word_probs                 # DeepSeek per-word probabilities
     from .spans import compute_spans                      # aggregate to soft + hard
 except ImportError:
@@ -109,20 +109,44 @@ def HalluSearch_inference(
             ans_originals = [pieces[i]["original_substring"] for i in ans_idxs]
             qa_facts      = [pieces[i]["factual_statement"]  for i in qa_idxs]
 
-            # (2) Retrieve contexts for BOTH groups
-            ctx_ans = [retrieve_context(f) for f in ans_facts]
-            ctx_qa  = [retrieve_context(f) for f in qa_facts]
+            # If there are no answer sentences, emit empty labels but keep id/texts
+            if not ans_facts:
+                pred = {
+                    "id": item.get("id"),
+                    "model_input": question,
+                    "model_output_text": answer,
+                    "hard_labels": [],
+                    "soft_labels": [],
+                    "verifications": [],
+                }
+                out.write(json.dumps(pred, ensure_ascii=False) + "\n")
+                continue
 
-            # (3) Enrich each answer context with a few QA contexts (still web-only evidence)
+            # (2) Retrieval:
+            # Use ONE QA-derived statement (if present) as the paired, specific hypothesis for evidence.
+            paired_fact = qa_facts[0] if qa_facts else None
+
+            # Primary context for each answer piece: retrieve on the paired QA claim (more specific), fallback to the answer fact.
+            ctx_primary = [retrieve_context(paired_fact or f) for f in ans_facts]
+
+            # Retrieve a few extra QA contexts (beyond the paired one) to enrich evidence
+            ctx_qa_rest = [retrieve_context(q) for q in (qa_facts[1:] if len(qa_facts) > 1 else [])]
+
+            # (3) Enrich each answer context with QA contexts (still web-only evidence)
             enriched_ctx = [
-                _enrich_context(c_primary, ctx_qa, max_chars=max_context_chars, qa_take=qa_take)
-                for c_primary in ctx_ans
+                _enrich_context(c_primary, ctx_qa_rest, max_chars=max_context_chars, qa_take=qa_take)
+                for c_primary in ctx_primary
             ]
 
             # (4) Verify ONLY answer pieces → per-word probabilities
+            # Pass the paired QA claim as the FACT (hypothesis), but score the ANSWER tokens (original_substring).
             verifs_ans = [
-                verify_word_probs(fact, orig, ctx)
-                for fact, orig, ctx in zip(ans_facts, ans_originals, enriched_ctx)
+                verify_word_probs(
+                    fact=(paired_fact or f),
+                    original_substring=o,
+                    context=c
+                )
+                for f, o, c in zip(ans_facts, ans_originals, enriched_ctx)
             ]
 
             # (5) Aggregate to soft; threshold to hard (answer-only)

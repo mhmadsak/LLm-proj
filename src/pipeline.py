@@ -1,197 +1,235 @@
 # src/pipeline.py
 import os
-import sys
-import json
-import glob
+from typing import Dict, Any, List, Tuple
+import requests
 
-# Make sibling imports work whether run as a module or a script
-try:
-    from .splitting import split_en_general            # Q/A-aware English splitter
-    from .retrieval import retrieve_context               # Google CSE retriever
-    from .verify import verify_word_probs                 # DeepSeek per-word probabilities
-    from .spans import compute_spans                      # aggregate to soft + hard
-except ImportError:
-    sys.path.append(os.path.dirname(__file__))
-    from splitting import split_en_general
-    from retrieval import retrieve_context
-    from verify import verify_word_probs
-    from spans import compute_spans
+from .retrieval import retrieve_context
+from .verify import verify_answer_probs
+from .splitting import extract_statements
+from .spans import (
+    token_spans,
+    aggregate_claims_to_answer_probs,
+    probs_to_hard_spans,
+    merge_to_soft_spans,
+)
 
+# ----------------------- env & config -----------------------
+CTX_MIN_LEN = int(os.getenv("CTX_MIN_LEN", "200"))
+OFFLINE = os.getenv("OFFLINE", "false").lower() == "true"
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-def _iter_jsonl(path: str):
+USE_CLAIM_SPLITTING = os.getenv("USE_CLAIM_SPLITTING", "0") == "1"   # toggle splitting
+PER_TOKEN_AGG = os.getenv("PER_TOKEN_AGG", "max")                     # max | mean | min
+
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_MODEL    = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")      # or deepseek-reasoner
+
+def _log(msg: str) -> None:
+    if DEBUG:
+        print(f"[pipeline] {msg}")
+
+# ----------------------- helpers ----------------------------
+def _is_weak(ctx: str, min_len: int = CTX_MIN_LEN) -> bool:
+    return not ctx or len(ctx) < min_len
+
+def _answer_token_count(ans: str) -> int:
+    return len(token_spans(ans or ""))
+
+def _llm_construct_reference_context(user_question: str, answer_text: str, min_chars: int = 400) -> str:
     """
-    Yield dicts from a .jsonl file (one JSON object per line),
-    or from all .jsonl files inside a directory.
+    Fallback #2: Ask DeepSeek to draft a neutral, reference-like context
+    when web retrieval fails. Returns "" if offline/missing key/too short.
     """
-    enc = "utf-8-sig"
-
-    if os.path.isdir(path):
-        files = sorted(glob.glob(os.path.join(path, "*.jsonl")))
-        if not files:
-            raise ValueError(f"No .jsonl files found in directory: {path}")
-        for fp in files:
-            yield from _iter_jsonl(fp)
-        return
-
-    if not path.lower().endswith(".jsonl"):
-        raise ValueError(f"Expected a .jsonl file (or directory). Got: {path}")
-
-    with open(path, "r", encoding=enc) as f:
-        for i, line in enumerate(f, 1):
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                yield json.loads(s)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"[JSONL parse error] {path} line {i}: {e}") from e
-
-
-def _enrich_context(primary: str, qa_contexts: list[str], max_chars: int = 1500, qa_take: int = 2) -> str:
-    """
-    Build the context for an ANSWER fact by concatenating:
-      - its own primary context (if any)
-      - up to `qa_take` QA-derived contexts
-    Truncated to `max_chars`.
-    """
-    chunks = []
-    if primary and primary.strip():
-        chunks.append(primary)
-    added = 0
-    for cx in qa_contexts:
-        if not cx or not cx.strip():
-            continue
-        chunks.append(cx)
-        added += 1
-        if added >= qa_take:
-            break
-    joined = "\n---\n".join(chunks) if chunks else ""
-    return joined[:max_chars]
-
-
-def HalluSearch_inference(
-    input_path: str,
-    output_file: str,
-    max_items_per_sample: int = 30,
-    hard_threshold: float = 0.5,
-    combine: str = "max",
-    qa_take: int = 2,
-    max_context_chars: int = 1500,
-):
-    """
-    Pipeline:
-      1) Read .jsonl (file or directory)
-      2) Split (EN) using both model_input (question) and model_output_text (answer)
-      3) Retrieve contexts for:
-           - answer-derived facts (for labeling)
-           - QA-derived facts (to enrich evidence)
-      4) For EACH answer fact, enrich its context with a few QA contexts (web text only)
-      5) Verify ONLY answer sentences → per-word probabilities
-      6) Aggregate to soft labels; threshold to hard labels
-      7) Write one JSONL line per input item
-    """
-    out_dir = os.path.dirname(output_file) or "."
-    os.makedirs(out_dir, exist_ok=True)
-
-    with open(output_file, "w", encoding="utf-8") as out:
-        for item in _iter_jsonl(input_path):
-            question = (item.get("model_input") or "").strip()
-            answer   = (item.get("model_output_text") or "").strip()
-
-            # (1) Split to atomic pieces (keeps verbatim substrings + origin tags)
-            pieces = split_en_general(question, answer, max_items=max_items_per_sample)
-
-            # Separate ANSWER vs QA-DERIVED
-            ans_idxs = [i for i, p in enumerate(pieces) if p.get("origin") == "answer"]
-            qa_idxs  = [i for i, p in enumerate(pieces) if p.get("origin") == "qa_derived"]
-
-            ans_facts     = [pieces[i]["factual_statement"]  for i in ans_idxs]
-            ans_originals = [pieces[i]["original_substring"] for i in ans_idxs]
-            qa_facts      = [pieces[i]["factual_statement"]  for i in qa_idxs]
-
-            # If there are no answer sentences, emit empty labels but keep id/texts
-            if not ans_facts:
-                pred = {
-                    "id": item.get("id"),
-                    "model_input": question,
-                    "model_output_text": answer,
-                    "hard_labels": [],
-                    "soft_labels": [],
-                    "verifications": [],
-                }
-                out.write(json.dumps(pred, ensure_ascii=False) + "\n")
-                continue
-
-            # (2) Retrieval:
-            # Use ONE QA-derived statement (if present) as the paired, specific hypothesis for evidence.
-            paired_fact = qa_facts[0] if qa_facts else None
-
-            # Primary context for each answer piece: retrieve on the paired QA claim (more specific), fallback to the answer fact.
-            ctx_primary = [retrieve_context(paired_fact or f) for f in ans_facts]
-
-            # Retrieve a few extra QA contexts (beyond the paired one) to enrich evidence
-            ctx_qa_rest = [retrieve_context(q) for q in (qa_facts[1:] if len(qa_facts) > 1 else [])]
-
-            # (3) Enrich each answer context with QA contexts (still web-only evidence)
-            enriched_ctx = [
-                _enrich_context(c_primary, ctx_qa_rest, max_chars=max_context_chars, qa_take=qa_take)
-                for c_primary in ctx_primary
-            ]
-
-            # (4) Verify ONLY answer pieces → per-word probabilities
-            # Pass the paired QA claim as the FACT (hypothesis), but score the ANSWER tokens (original_substring).
-            verifs_ans = [
-                verify_word_probs(
-                    fact=(paired_fact or f),
-                    original_substring=o,
-                    context=c
-                )
-                for f, o, c in zip(ans_facts, ans_originals, enriched_ctx)
-            ]
-
-            # (5) Aggregate to soft; threshold to hard (answer-only)
-            hard_spans, soft_spans = compute_spans(
-                answer_text=answer,
-                originals=ans_originals,
-                verifs=verifs_ans,
-                threshold=hard_threshold,
-                combine=combine,  # "max" | "mean" | "min"
-            )
-
-            # (6) Emit one JSONL line
-            pred = {
-                "id": item.get("id"),
-                "model_input": question,
-                "model_output_text": answer,
-                "hard_labels": hard_spans,   # [[start, end], ...]
-                "soft_labels": soft_spans,   # [{start,end,prob}, ...]
-                "verifications": verifs_ans, # ONLY answer-based verifications
-            }
-            out.write(json.dumps(pred, ensure_ascii=False) + "\n")
-
-
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help=".jsonl file or directory")
-    ap.add_argument("--output", required=True, help="output .jsonl path")
-    ap.add_argument("--max-items", dest="max_items", type=int, default=30, help="max facts per sample")
-    ap.add_argument("--hard-threshold", dest="hard_threshold", type=float, default=0.5,
-                    help="prob >= threshold → hard hallucination token")
-    ap.add_argument("--combine", choices=["max", "mean", "min"], default="max",
-                    help="how to combine duplicate-token probabilities across answer sentences")
-    ap.add_argument("--qa-take", dest="qa_take", type=int, default=2,
-                    help="how many QA contexts to append to each answer context")
-    ap.add_argument("--max-context-chars", dest="max_context_chars", type=int, default=1500,
-                    help="truncate enriched context to this many characters")
-    args = ap.parse_args()
-
-    HalluSearch_inference(
-        input_path=args.input,
-        output_file=args.output,
-        max_items_per_sample=args.max_items,
-        hard_threshold=args.hard_threshold,
-        combine=args.combine,
-        qa_take=args.qa_take,
-        max_context_chars=args.max_context_chars,
+    if OFFLINE or not DEEPSEEK_API_KEY:
+        return ""
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    prompt = (
+        "You are a careful reference writer. Based ONLY on general encyclopedic knowledge, "
+        "draft a neutral, citation-style context that could be used to check the answer. "
+        "No opinions or reasoning steps. Write 1–2 concise paragraphs covering names, dates, "
+        "definitions, lists, and distinctions likely relevant to verifying the answer.\n\n"
+        f"QUESTION:\n{user_question}\n\nANSWER:\n{answer_text}"
     )
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 600,
+    }
+    try:
+        r = requests.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        text = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        text = text.strip()
+        if len(text) < min_chars:
+            return ""
+        return text
+    except Exception as e:
+        _log(f"LLM context error: {e}")
+        return ""
+
+def _map_token_spans_to_char_spans(ans: str, token_spans_list: List[Tuple[int, int]],
+                                   hard_spans_tok: List[Tuple[int, int]],
+                                   soft_spans_tok: List[Dict[str, Any]]):
+    """
+    Convert token-index spans to character-index spans using the provided token offsets.
+    """
+    def tokspan_to_charspan(s_tok: int, e_tok: int):
+        if e_tok <= s_tok or s_tok < 0 or e_tok > len(token_spans_list):
+            return None
+        return [token_spans_list[s_tok][0], token_spans_list[e_tok - 1][1]]
+
+    hard_labels_char: List[List[int]] = []
+    for s_tok, e_tok in hard_spans_tok:
+        ce = tokspan_to_charspan(s_tok, e_tok)
+        if ce is not None:
+            hard_labels_char.append(ce)
+
+    soft_labels_char: List[Dict[str, Any]] = []
+    for d in soft_spans_tok:  # {"start": s_tok, "end": e_tok, "prob": p}
+        ce = tokspan_to_charspan(d["start"], d["end"])
+        if ce is not None:
+            soft_labels_char.append({"start": ce[0], "end": ce[1], "prob": d["prob"]})
+
+    return hard_labels_char, soft_labels_char
+
+# ----------------------- main API ---------------------------
+def process_sample(
+    sample: Dict[str, Any],
+    hard_threshold: float = 0.6,
+    combine: str = "mean",
+) -> Dict[str, Any]:
+    """
+    Orchestrates:
+      1) Retrieve with model_input only (primary + keyword retry).
+      2) If still weak → Fallback #2 (LLM reference context).
+      3) Verify:
+         - whole-answer mode (default), or
+         - claim-splitting mode (USE_CLAIM_SPLITTING=1) with aggregation.
+      4) Build hard/soft spans and map to character intervals.
+    """
+    sid   = sample.get("id")
+    q_in  = (sample.get("model_input") or "").strip()
+    ans   = (sample.get("model_output_text") or "").strip()
+
+    meta = {
+        "ctx_source": "none",           # cse | cse_keywords | llm_constructed | none
+        "ctx_len": 0,
+        "offline": OFFLINE,
+        "verify_model": DEEPSEEK_MODEL,
+        "hard_threshold": hard_threshold,
+        "combine": combine,
+        "use_claim_splitting": USE_CLAIM_SPLITTING,
+        "per_token_agg": PER_TOKEN_AGG,
+    }
+
+    # 1) Retrieval (model_input only) with keyword fallback
+    ctx, rmeta = retrieve_context(q_in, k=5)
+    meta.update({k: v for k, v in rmeta.items() if k in ("raw_query", "keyword_query")})
+    meta["ctx_source"] = rmeta.get("ctx_source", "none")
+    meta["ctx_len"]    = len(ctx)
+    _log(f"retrieval source={meta['ctx_source']} len={meta['ctx_len']}")
+
+    # 2) Fallback #2: LLM-constructed reference context
+    if _is_weak(ctx):
+        _log("primary retrieval weak → trying llm_constructed context")
+        ctx_llm = _llm_construct_reference_context(q_in, ans)
+        if not _is_weak(ctx_llm):
+            ctx = ctx_llm
+            meta["ctx_source"] = "llm_constructed"
+            meta["ctx_len"] = len(ctx)
+            _log(f"llm_constructed context len={meta['ctx_len']}")
+
+    # 3) If still weak → UNKNOWN with neutral 0.6 per token
+    if _is_weak(ctx):
+        n_tok = _answer_token_count(ans)
+        token_probs = [0.6] * n_tok
+        return {
+            "id": sid,
+            "model_input": q_in,
+            "model_output_text": ans,
+            "retrieved_context": "",
+            "verdict": "UNKNOWN",
+            "token_probs": token_probs,
+            "hard_labels": [],
+            "soft_labels": [],
+            "meta": meta,
+        }
+
+    # 4) Verification
+    if USE_CLAIM_SPLITTING:
+        # Split into claims (as exact substrings when available)
+        parts = extract_statements(ans) or []
+        claim_texts: List[str] = []
+        for i, obj in enumerate(parts, start=1):
+            orig_key = f"original_substring_{i}"
+            fact_key = f"factual_statement_{i}"
+            claim_texts.append(obj.get(orig_key) or obj.get(fact_key) or "")
+
+        claim_probs_list: List[List[float]] = []
+        claim_verdicts: List[str] = []
+        for ct in claim_texts:
+            v = verify_answer_probs(ct, ctx)
+            claim_verdicts.append(v.get("verdict", "UNKNOWN"))
+            claim_probs_list.append([float(x) for x in (v.get("token_probs") or [])])
+
+        # Aggregate claim-level probs back to the full answer tokens
+        token_probs = aggregate_claims_to_answer_probs(
+            answer_text=ans,
+            claim_originals=claim_texts,
+            claim_token_probs=claim_probs_list,
+            per_token_agg=PER_TOKEN_AGG,
+            default_prob=0.6,
+        )
+
+        # Verdict policy from claims
+        if any(v == "NOT SUPPORTED" for v in claim_verdicts):
+            verdict = "NOT SUPPORTED"
+        elif all(v == "SUPPORTED" for v in claim_verdicts if v != "UNKNOWN") and token_probs and max(token_probs) < hard_threshold:
+            verdict = "SUPPORTED"
+        else:
+            verdict = "PARTIAL"
+        meta["claims_count"] = len(claim_texts)
+    else:
+        vres = verify_answer_probs(ans, ctx)
+        token_probs = [float(x) for x in (vres.get("token_probs") or [])]
+        verdict     = vres.get("verdict", "UNKNOWN")
+
+    # 5) Spans (token-index) → map to character intervals
+    hard_spans_tok = probs_to_hard_spans(token_probs, hard_threshold=hard_threshold, dead_zone=0.08)
+    soft_spans_tok = merge_to_soft_spans(token_probs, hard_spans_tok, combine=combine)
+
+    tok_offsets = token_spans(ans)  # [(start_char, end_char) for each token]
+    hard_labels_char, soft_labels_char = _map_token_spans_to_char_spans(
+        ans, tok_offsets, hard_spans_tok, soft_spans_tok
+    )
+
+    # 6) Return record
+    return {
+        "id": sid,
+        "model_input": q_in,
+        "model_output_text": ans,
+        "retrieved_context": ctx,
+        "verdict": verdict,              # "SUPPORTED" | "NOT SUPPORTED" | "PARTIAL" | "UNKNOWN"
+        "token_probs": token_probs,      # per-answer-token probs (raw floats)
+        "hard_labels": hard_labels_char, # [[start_char, end_char], ...]
+        "soft_labels": soft_labels_char, # [{"start":..,"end":..,"prob":..}, ...]
+        "meta": meta,
+    }
+
+# ------------- optional back-compat wrapper (legacy code) -------------------
+def HalluSearch_inference(input_path: str, output_file: str,
+                          hard_threshold: float = 0.6,
+                          combine: str = "mean",
+                          max_items_per_sample: int = None):
+    """
+    Legacy wrapper to mimic older entrypoint.
+    Reads JSONL, processes samples with process_sample, writes JSONL.
+    Ignores 'max_items_per_sample' (kept for compatibility).
+    """
+    from .io_utils import read_jsonl, write_jsonl
+    rows_out = []
+    for sample in read_jsonl(input_path):
+        rows_out.append(process_sample(sample, hard_threshold=hard_threshold, combine=combine))
+    write_jsonl(output_file, rows_out)

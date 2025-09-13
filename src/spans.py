@@ -1,75 +1,102 @@
 # src/spans.py
 import re
-from typing import List, Dict, Tuple
+from typing import List, Tuple, Literal, Dict
 
 _TOKEN_RE = re.compile(r"\S+")
 
-def _tokenize_with_spans(text: str):
-    return [{"i": i, "start": m.start(), "end": m.end()} for i, m in enumerate(_TOKEN_RE.finditer(text or ""))]
+def token_spans(text: str) -> List[Tuple[int, int]]:
+    return [(m.start(), m.end()) for m in _TOKEN_RE.finditer(text or "")]
 
-def _merge_adjacent(spans: List[List[int]]) -> List[List[int]]:
-    if not spans: return []
-    spans = sorted(spans)
-    out = [spans[0]]
-    for s, e in spans[1:]:
-        ls, le = out[-1]
-        if s <= le:
-            out[-1][1] = max(le, e)
-        else:
-            out.append([s, e])
-    return out
+def _overlap(a: Tuple[int,int], b: Tuple[int,int]) -> int:
+    return max(0, min(a[1], b[1]) - max(a[0], b[0]))
 
-def _combine(vals: List[float], mode: str) -> float:
-    if not vals: return 0.5
-    if mode == "mean":
-        return sum(vals) / len(vals)
-    if mode == "min":
-        return min(vals)
-    # default: "max" → conservative for hallucinations
-    return max(vals)
-
-def compute_spans(answer_text: str,
-                  originals: List[str],
-                  verifs: List[Dict],
-                  threshold: float = 0.5,
-                  combine: str = "max") -> Tuple[List[List[int]], List[Dict]]:
+def aggregate_claims_to_answer_probs(
+    answer_text: str,
+    claim_originals: List[str],
+    claim_token_probs: List[List[float]],
+    per_token_agg: Literal["max", "mean", "min"] = "max",
+    default_prob: float = 0.6
+) -> List[float]:
     """
-    Aggregate per-token probabilities across multiple facts that point to the same substring.
-    Returns:
-      hard: [[start, end], ...]
-      soft: [{"start": s, "end": e, "prob": p}, ...]
+    Map per-claim token probs onto answer tokens and aggregate per answer token.
+    - claim_originals[i] must be the exact substring from the answer for claim i.
+    - claim_token_probs[i] corresponds to tokenization of claim_originals[i] w/ \S+ regex.
+    Returns list of probs aligned to answer tokens.
     """
-    acc: Dict[Tuple[int,int], List[float]] = {}
+    ans_spans = token_spans(answer_text)
+    n_ans = len(ans_spans)
+    buckets: List[List[float]] = [[] for _ in range(n_ans)]
 
-    for orig, v in zip(originals, verifs):
-        if not isinstance(v, dict) or "token_probs" not in v:
+    for orig, probs in zip(claim_originals or [], claim_token_probs or []):
+        if not orig:
             continue
-        probs = v["token_probs"]
-        base = (answer_text or "").find(orig or "")
+        base = (answer_text or "").find(orig)
         if base < 0:
-            continue
-        toks = _tokenize_with_spans(orig or "")
-        for t in toks:
-            i, s, e = t["i"], t["start"], t["end"]
-            p = float(probs[i]) if i < len(probs) else 0.5
-            key = (base + s, base + e)
-            acc.setdefault(key, []).append(p)
+            continue  # can't map if substring not found
+        claim_spans_rel = token_spans(orig)
+        claim_spans_abs = [(base + s, base + e) for (s, e) in claim_spans_rel]
+        # map each claim token prob to overlapping answer tokens
+        for p, cspan in zip(probs, claim_spans_abs):
+            try:
+                pv = float(p)
+            except Exception:
+                pv = default_prob
+            pv = 0.0 if pv < 0.0 else 1.0 if pv > 1.0 else pv
+            for i, aspan in enumerate(ans_spans):
+                if _overlap(cspan, aspan) > 0:
+                    buckets[i].append(pv)
 
-    # combine and build soft/hard
-    soft = []
-    for (s, e), vals in acc.items():
-        p = _combine(vals, combine)
-        soft.append({"start": s, "end": e, "prob": float(p)})
+    def _reduce(vals: List[float]) -> float:
+        if not vals: return default_prob
+        if per_token_agg == "mean": return sum(vals)/len(vals)
+        if per_token_agg == "min":  return min(vals)
+        return max(vals)  # default "max" conservative for hallucination
 
-    hard = [[d["start"], d["end"]] for d in soft if d["prob"] >= threshold]
-    hard = _merge_adjacent(hard)
-    return hard, soft
+    return [_reduce(vs) for vs in buckets]
 
-# Backwards-compatible wrappers (if other code still imports these names)
-def extract_predicted_spans_hard(answer_text, originals, verifs, threshold=0.5, combine="max"):
-    hard, _ = compute_spans(answer_text, originals, verifs, threshold=threshold, combine=combine)
-    return hard
+def probs_to_hard_spans(
+    probs: List[float],
+    hard_threshold: float = 0.6,
+    dead_zone: float = 0.08,
+) -> List[Tuple[int, int]]:
+    """
+    Maximal contiguous spans [start, end) of token indices where token is 'hard':
+      p_i >= hard_threshold AND |p_i - hard_threshold| >= dead_zone
+    """
+    spans: List[Tuple[int, int]] = []
+    i, n = 0, len(probs)
+    while i < n:
+        p = float(probs[i])
+        if (p >= hard_threshold) and (abs(p - hard_threshold) >= dead_zone):
+            start = i
+            i += 1
+            while i < n:
+                q = float(probs[i])
+                if not ((q >= hard_threshold) and (abs(q - hard_threshold) >= dead_zone)):
+                    break
+                i += 1
+            spans.append((start, i))
+        else:
+            i += 1
+    return spans
 
-def extract_predicted_spans_soft(answer_text, originals, verifs, combine="max"):
-    _, soft = compute_spans(answer_text, originals, verifs, threshold=0.5, combine=combine)
-    return soft
+def _combine(vals: List[float], how: Literal["mean", "max", "min"]) -> float:
+    if not vals: return 0.0
+    if how == "max": return max(vals)
+    if how == "min": return min(vals)
+    return sum(vals) / len(vals)
+
+def merge_to_soft_spans(
+    probs: List[float],
+    hard_spans: List[Tuple[int, int]],
+    combine: Literal["mean", "max", "min"] = "mean",
+) -> List[Dict]:
+    """
+    Convert hard spans to soft spans with an aggregate probability per span.
+    Returns: [{"start": s, "end": e, "prob": p}, ...]
+    """
+    out: List[Dict] = []
+    for s, e in hard_spans:
+        p = _combine([float(x) for x in probs[s:e]], combine)
+        out.append({"start": s, "end": e, "prob": float(p)})
+    return out

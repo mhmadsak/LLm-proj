@@ -1,144 +1,127 @@
-import os, re, requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-from pathlib import Path
-from dotenv import load_dotenv, find_dotenv
 
-# robust .env load
-load_dotenv(find_dotenv(usecwd=True), override=True)
-root_env = Path(__file__).resolve().parents[1] / ".env"
-if root_env.exists():
-    load_dotenv(root_env, override=True)
+import os
+import re
+import time
+from typing import List, Tuple, Dict, Optional
 
-GOOGLE_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
-GOOGLE_CX  = os.getenv("GOOGLE_SEARCH_ENGINE")
-OFFLINE    = os.getenv("OFFLINE", "false").lower() == "true"
-DEBUG      = os.getenv("DEBUG", "1") == "1"
+import requests
 
-# Prefer authoritative domains; skip noisy ones
-WHITELIST = (
-    "wikipedia.org", "britannica.com", ".edu", ".gov", "un.org",
-    "who.int", "nature.com", "sciencedirect.com", "nih.gov",
-    "olympics.com", "olympedia.org"
-)
-BLOCKLIST = (
-    "reddit.com", "facebook.com", "twitter.com", "x.com",
-    "quora.com", "stackexchange.com", "flightaware.com",
-    "aclanthology.org", "huggingface.co"
-)
+# --------------------------- Config -----------------------------------------
 
-def _log(m): 
-    if DEBUG: print(f"[retrieval] {m}")
+CTX_MIN_LEN = int(os.getenv("CTX_MIN_LEN", "200"))
 
-def _clean_fact(f: str) -> str:
-    f = (f or "").replace("…", " ").strip()
-    f = re.sub(r"\s+", " ", f)
-    f = re.sub(r"^(yes|no|however|but|and|so|thus),?\s+", "", f, flags=re.I)
-    return f
+def _is_weak(ctx: str, min_len: int = CTX_MIN_LEN) -> bool:
+    return not ctx or len(ctx) < min_len
 
-def _ok_domain(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    if any(b in host for b in BLOCKLIST): return False
-    return any(host == w or host.endswith(w) for w in WHITELIST)
+# ----------------------- Google CSE Search ----------------------------------
 
-def _require_google():
-    if not GOOGLE_KEY or not GOOGLE_CX:
-        raise RuntimeError("Set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE in .env")
-
-def google_search(query, num=8):
-    if OFFLINE:
-        _log("OFFLINE → skip CSE")
-        return []
-    _require_google()
-    url = "https://www.googleapis.com/customsearch/v1"
-    r = requests.get(url, params={"key": GOOGLE_KEY, "cx": GOOGLE_CX, "q": query, "num": min(10, num)}, timeout=25)
-    if r.status_code != 200:
-        _log(f"CSE {r.status_code}: {r.text[:160]}")
-        return []
-    items = r.json().get("items", []) or []
-    links = [it.get("link") for it in items if it.get("link")]
-    _log(f"q='{query[:70]}…' hits={len(links)}")
-    return links[:num]
-
-def get_page_text(url):
-    try:
-        r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script", "style", "noscript"]): t.decompose()
-        txt = soup.get_text(" ", strip=True)
-        return re.sub(r"\s+", " ", txt)[:8000]
-    except Exception as e:
-        _log(f"fetch fail {url}: {e}")
+def google_cse_search(query: str, k: int = 5, timeout_s: float = 8.0, retries: int = 2) -> str:
+    """
+    Query Google Custom Search Engine and return a newline-joined blob of
+    (title + snippet + url) lines. Returns "" on failure or OFFLINE mode.
+    """
+    if not query or not query.strip():
+        return ""
+    if os.getenv("OFFLINE", "").lower() == "true":
         return ""
 
-def _best_window(text: str, query: str, win=1200):
-    """Cheap keyword windowing so verify sees the most relevant chunk."""
-    if not text: return ""
-    q_terms = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\-']+", query) if len(w) > 2][:12]
-    if not q_terms: return text[:win]
-    best, bi = 0, 0
-    step = max(1, win // 2)
-    L = len(text)
-    for i in range(0, max(1, L - win), step):
-        chunk = text[i:i+win].lower()
-        score = sum(chunk.count(t) for t in q_terms)
-        if score > best: best, bi = score, i
-    return text[bi:bi+win]
+    api_key = os.getenv("GOOGLE_SEARCH_API_KEY")
+    engine_id = os.getenv("GOOGLE_SEARCH_ENGINE")
+    if not api_key or not engine_id:
+        return ""
 
-def _person_hint(fact: str) -> str:
-    """
-    Very small heuristic: take words before ' won| is | was ' as a name candidate.
-    Handles particles like 'van', 'de', 'von' in lowercase.
-    """
-    m = re.split(r"\b(won|is|was)\b", fact, maxsplit=1, flags=re.I)
-    head = m[0].strip() if m else fact.strip()
-    # Keep up to ~5 tokens, allow lowercase particles inside
-    tokens = head.split()
-    if 1 <= len(tokens) <= 7 and any(t[0:1].isupper() for t in tokens):
-        return " ".join(tokens)
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": api_key, "cx": engine_id, "q": query, "num": min(k, 10)}
+
+    last_err: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("items", []) or []
+                lines = []
+                for it in items[:k]:
+                    title = it.get("title", "") or ""
+                    snippet = it.get("snippet", "") or ""
+                    link = it.get("link", "") or ""
+                    lines.append(" ".join([title, snippet, link]).strip())
+                return "\n".join(lines).strip()
+            else:
+                last_err = Exception(f"HTTP {resp.status_code}")
+        except Exception as e:
+            last_err = e
+        time.sleep(0.5 * (attempt + 1))  # simple backoff
     return ""
 
-def _topic_queries(fact: str):
-    """Generate multiple queries; bias to authoritative sites for Olympics-like claims."""
-    q = _clean_fact(fact)
-    queries = [q]
-    # quoted head (first ~10 tokens)
-    head = " ".join(q.split()[:10])
-    if head:
-        queries.append(f"\"{head}\"")
-    # Olympics / medal heuristics
-    if re.search(r"\b(olympic|olympics|medal|summer games|winter games)\b", q, flags=re.I):
-        name = _person_hint(q)
-        if name:
-            queries += [
-                f"\"{name}\" site:olympics.com",
-                f"\"{name}\" site:olympedia.org",
-                f"\"{name}\" site:wikipedia.org",
-            ]
-        queries += [
-            f"{q} site:olympics.com",
-            f"{q} site:olympedia.org",
-            f"{q} site:wikipedia.org",
-        ]
-    return queries
+# -------------------- Keyword fallback (question-only) ----------------------
 
-def retrieve_context(fact: str) -> str:
-    # Try a few targeted queries, dedupe links, prefer whitelist
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)?")
+
+def extract_keywords(text: str, min_len: int = 3, max_keywords: int = 8) -> List[str]:
+    """
+    Minimal keyword extractor:
+      - alphanumeric (allows -/_),
+      - keep tokens with len >= min_len (digits may be shorter),
+      - deduplicate preserving order.
+    """
+    if not text:
+        return []
     seen = set()
-    cand = []
-    for qq in _topic_queries(fact):
-        for link in google_search(qq, num=8):
-            if link in seen: continue
-            seen.add(link)
-            cand.append(link)
-    # prioritize authoritative domains first
-    pri = [u for u in cand if _ok_domain(u)] + [u for u in cand if not _ok_domain(u)]
-    for link in pri[:8]:
-        txt = get_page_text(link)
-        if len(txt) >= 400:
-            snip = _best_window(txt, _clean_fact(fact), win=1200)
-            _log(f"context_ok len={len(snip)} from={link}")
-            return snip
-    _log("no context found")
-    return ""
+    out: List[str] = []
+    for m in _TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        low = tok.lower()
+        if len(low) < min_len and not low.isdigit():
+            continue
+        if low not in seen:
+            seen.add(low)
+            out.append(tok)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+def build_keyword_query(user_question: str, max_keywords: int = 8) -> str:
+    """
+    Construct a keyword-only query from the user question.
+    """
+    kws = extract_keywords(user_question, max_keywords=max_keywords)
+    return " ".join(kws)
+
+# --------------------- Public: retrieve with fallback -----------------------
+
+def retrieve_context(user_question: str, k: int = 5) -> Tuple[str, Dict]:
+    """
+    Try primary Google CSE with the raw question.
+    If weak/empty, retry with keyword-only query.
+    Returns (context, meta).
+    meta includes:
+      - ctx_source: 'cse' | 'cse_keywords' | 'none'
+      - raw_query / keyword_query (when applicable)
+      - ctx_len
+    """
+    meta: Dict = {
+        "ctx_source": "none",
+        "ctx_len": 0,
+        "raw_query": (user_question or "").strip(),
+    }
+
+    # Primary: raw question
+    ctx = google_cse_search(meta["raw_query"], k=k)
+    if not _is_weak(ctx):
+        meta["ctx_source"] = "cse"
+        meta["ctx_len"] = len(ctx)
+        return ctx, meta
+
+    # Fallback #1: keyword query (question only)
+    kw_query = build_keyword_query(user_question, max_keywords=8)
+    meta["keyword_query"] = kw_query
+    ctx2 = google_cse_search(kw_query, k=max(k, 6)) if kw_query else ""
+    if not _is_weak(ctx2):
+        meta["ctx_source"] = "cse_keywords"
+        meta["ctx_len"] = len(ctx2)
+        return ctx2, meta
+
+    # Still weak → let pipeline decide LLM fallback
+    meta["ctx_len"] = 0
+    return "", meta

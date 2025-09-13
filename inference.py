@@ -1,18 +1,32 @@
 # inference.py
 import argparse
-from src.pipeline import HalluSearch_inference
+import os
+from src.pipeline import process_sample  # new per-sample orchestrator
+from src.io_utils import read_jsonl, write_jsonl
 
-if __name__ == "__main__":
+def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--hard-threshold", dest="hard_threshold", type=float, default=0.5)
-    p.add_argument("--max-items", dest="max_items", type=int, default=30)
+    p.add_argument("--hard-threshold", dest="hard_threshold", type=float, default=0.6)
+    p.add_argument("--combine", choices=["mean", "max", "min"], default="mean",
+                   help="combine rule for soft span probability")
+    p.add_argument("--limit", type=int, default=0, help="process only the first N samples (0=all)")
+    p.add_argument("--offline", action="store_true", help="force OFFLINE mode (no web/API calls)")
     args = p.parse_args()
 
-    HalluSearch_inference(
-        input_path=args.input,
-        output_file=args.output,
-        max_items_per_sample=args.max_items,
-        hard_threshold=args.hard_threshold,
-    )
+    if args.offline:
+        os.environ["OFFLINE"] = "true"
+
+    rows_out = []
+    for i, sample in enumerate(read_jsonl(args.input), start=1):
+        if args.limit and i > args.limit:
+            break
+        rows_out.append(process_sample(sample,
+                                       hard_threshold=args.hard_threshold,
+                                       combine=args.combine))
+
+    write_jsonl(args.output, rows_out)
+
+if __name__ == "__main__":
+    main()

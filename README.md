@@ -23,3 +23,4 @@ python inference.py \
 
 # 3. Evaluate
 python scorer.py data/val/mushroom.de-val.v2.jsonl data/preds/pred-de.jsonl data/preds/metrics_de.txt
+The results are saved in `data/preds/metrics_de.txt`.Note that this example of running is to test the evaluation on german language ,for other tests choose the desired data path

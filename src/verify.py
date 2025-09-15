@@ -176,11 +176,4 @@ Now, for the CURRENT task, return ONLY the final JSON object with exactly {n_tok
 
     return {"verdict": verdict, "token_probs": coerced}
 
-# --- Backward-compat shims --------------------------------------------------
-def verify_word_probs(fact: str, _unused: str, context: str):
-    """Deprecated shim: routes to verify_answer_probs."""
-    return verify_answer_probs(fact, context)
 
-def verify_facts_with_context(fact: str, context: str):
-    """Deprecated shim: routes to verify_answer_probs."""
-    return verify_answer_probs(fact, context)

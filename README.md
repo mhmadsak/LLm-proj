@@ -8,8 +8,8 @@ This project implements a search-enhanced RAG pipeline for detecting hallucinate
 
 ```bash
 # 1. Setup
-git clone <your-repo-url>
-cd <your-repo-name>
+git clone <https://github.com/mhmadsak/LLm-proj.git >
+cd <llm-proj>
 echo "DEEPSEEK_API_KEY=your_deepseek_api_key" >> .env
 echo "GOOGLE_SEARCH_API_KEY=your_google_search_api_key" >> .env
 echo "GOOGLE_SEARCH_ENGINE=your_google_cse_id" >> .env
